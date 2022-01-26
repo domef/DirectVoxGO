@@ -9,7 +9,7 @@ from .load_deepvoxels import load_dv_data
 from .load_co3d import load_co3d_data
 
 
-def load_data(args):
+def load_data(args, use_masks):
 
     K, depths = None, None
 
@@ -71,11 +71,21 @@ def load_data(args):
 
         near, far = inward_nearfar_heuristic(poses[i_train, :3, 3], ratio=0)
 
+        print(f'NEAR, FAR: {near}, {far}')
+
+        masks = None
         if images.shape[-1] == 4:
-            if args.white_bkgd:
-                images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
+            if not use_masks:
+                if args.white_bkgd:
+                    images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
+                else:
+                    images = images[...,:3]*images[...,-1:]
             else:
-                images = images[...,:3]*images[...,-1:]
+                masks = images[..., -1]
+                images = images[..., :3]
+
+        if masks is None:
+            masks = np.ones_like(images)
 
     elif args.dataset_type == 'nsvf':
         images, poses, render_poses, hwf, i_split = load_nsvf_data(args.datadir)
@@ -145,6 +155,7 @@ def load_data(args):
         poses=poses, render_poses=render_poses,
         images=images, depths=depths,
         irregular_shape=irregular_shape,
+        masks=masks
     )
     return data_dict
 

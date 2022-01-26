@@ -50,6 +50,7 @@ def config_parser():
                         help='frequency of console printout and metric loggin')
     parser.add_argument("--i_weights", type=int, default=100000,
                         help='frequency of weight ckpt saving')
+    parser.add_argument("--use_masks", action="store_true")
     return parser
 
 
@@ -142,13 +143,13 @@ def seed_everything():
 def load_everything(args, cfg):
     '''Load images / poses / camera settings / data split.
     '''
-    data_dict = load_data(cfg.data)
+    data_dict = load_data(cfg.data, args.use_masks)
 
     # remove useless field
     kept_keys = {
             'hwf', 'HW', 'Ks', 'near', 'far',
             'i_train', 'i_val', 'i_test', 'irregular_shape',
-            'poses', 'render_poses', 'images'}
+            'poses', 'render_poses', 'images', 'masks'}
     for k in list(data_dict.keys()):
         if k not in kept_keys:
             data_dict.pop(k)
@@ -156,8 +157,10 @@ def load_everything(args, cfg):
     # construct data tensor
     if data_dict['irregular_shape']:
         data_dict['images'] = [torch.FloatTensor(im, device='cpu') for im in data_dict['images']]
+        data_dict['masks'] = [torch.FloatTensor(im, device='cpu') for im in data_dict['masks']]
     else:
         data_dict['images'] = torch.FloatTensor(data_dict['images'], device='cpu')
+        data_dict['masks'] = torch.FloatTensor(data_dict['masks'], device='cpu')
     data_dict['poses'] = torch.Tensor(data_dict['poses'])
     return data_dict
 
@@ -211,9 +214,9 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
         xyz_shift = (xyz_max - xyz_min) * (cfg_model.world_bound_scale - 1) / 2
         xyz_min -= xyz_shift
         xyz_max += xyz_shift
-    HW, Ks, near, far, i_train, i_val, i_test, poses, render_poses, images = [
+    HW, Ks, near, far, i_train, i_val, i_test, poses, render_poses, images, masks = [
         data_dict[k] for k in [
-            'HW', 'Ks', 'near', 'far', 'i_train', 'i_val', 'i_test', 'poses', 'render_poses', 'images'
+            'HW', 'Ks', 'near', 'far', 'i_train', 'i_val', 'i_test', 'poses', 'render_poses', 'images', 'masks'
         ]
     ]
 
@@ -266,20 +269,32 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
     }
 
     # init batch rays sampler
-    def gather_training_rays():
+    def gather_training_rays(masks):
         if data_dict['irregular_shape']:
             rgb_tr_ori = [images[i].to('cpu' if cfg.data.load2gpu_on_the_fly else device) for i in i_train]
+            masks = [masks[i].bool().to('cpu' if cfg.data.load2gpu_on_the_fly else device) for i in i_train]
         else:
             rgb_tr_ori = images[i_train].to('cpu' if cfg.data.load2gpu_on_the_fly else device)
+            masks = masks[i_train].bool().to('cpu' if cfg.data.load2gpu_on_the_fly else device)
 
         if cfg_train.ray_sampler == 'in_maskcache':
-            rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz = dvgo.get_training_rays_in_maskcache_sampling(
-                    rgb_tr_ori=rgb_tr_ori,
-                    train_poses=poses[i_train],
-                    HW=HW[i_train], Ks=Ks[i_train],
-                    ndc=cfg.data.ndc, inverse_y=cfg.data.inverse_y,
-                    flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y,
-                    model=model, render_kwargs=render_kwargs)
+            if not args.use_masks:
+                rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz = dvgo.get_training_rays_in_maskcache_sampling(
+                        rgb_tr_ori=rgb_tr_ori,
+                        train_poses=poses[i_train],
+                        HW=HW[i_train], Ks=Ks[i_train],
+                        ndc=cfg.data.ndc, inverse_y=cfg.data.inverse_y,
+                        flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y,
+                        model=model, render_kwargs=render_kwargs)
+            else:
+                rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz = dvgo.get_training_rays_masked_in_maskcache_sampling(
+                        rgb_tr_ori=rgb_tr_ori,
+                        train_poses=poses[i_train],
+                        HW=HW[i_train], Ks=Ks[i_train],
+                        ndc=cfg.data.ndc, inverse_y=cfg.data.inverse_y,
+                        flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y,
+                        model=model, render_kwargs=render_kwargs,
+                        masks=masks)
         elif cfg_train.ray_sampler == 'flatten':
             rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz = dvgo.get_training_rays_flatten(
                 rgb_tr_ori=rgb_tr_ori,
@@ -287,16 +302,24 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
                 HW=HW[i_train], Ks=Ks[i_train], ndc=cfg.data.ndc, inverse_y=cfg.data.inverse_y,
                 flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y)
         else:
-            rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz = dvgo.get_training_rays(
-                rgb_tr=rgb_tr_ori,
-                train_poses=poses[i_train],
-                HW=HW[i_train], Ks=Ks[i_train], ndc=cfg.data.ndc, inverse_y=cfg.data.inverse_y,
-                flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y)
+            if not args.use_masks:
+                rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz = dvgo.get_training_rays(
+                    rgb_tr=rgb_tr_ori,
+                    train_poses=poses[i_train],
+                    HW=HW[i_train], Ks=Ks[i_train], ndc=cfg.data.ndc, inverse_y=cfg.data.inverse_y,
+                    flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y)
+            else:
+                rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz = dvgo.get_training_rays_masked(
+                    rgb_tr_ori=rgb_tr_ori,
+                    train_poses=poses[i_train],
+                    HW=HW[i_train], Ks=Ks[i_train], ndc=cfg.data.ndc, inverse_y=cfg.data.inverse_y,
+                    flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y,
+                    masks=masks)
         index_generator = dvgo.batch_indices_generator(len(rgb_tr), cfg_train.N_rand)
         batch_index_sampler = lambda: next(index_generator)
         return rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz, batch_index_sampler
 
-    rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz, batch_index_sampler = gather_training_rays()
+    rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz, batch_index_sampler = gather_training_rays(masks)
 
     # view-count-based learning rate
     if cfg_train.pervoxel_lr:
@@ -324,7 +347,7 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
             model.density.data.sub_(1)
 
         # random sample rays
-        if cfg_train.ray_sampler in ['flatten', 'in_maskcache']:
+        if cfg_train.ray_sampler in ['flatten', 'in_maskcache'] or (cfg_train.ray_sampler == 'random' and args.use_masks):
             sel_i = batch_index_sampler()
             target = rgb_tr[sel_i]
             rays_o = rays_o_tr[sel_i]

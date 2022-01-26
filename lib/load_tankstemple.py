@@ -10,7 +10,7 @@ import cv2
 
 def load_tankstemple_data(basedir):
     pose_paths = sorted(glob.glob(os.path.join(basedir, 'pose', '*txt')))
-    rgb_paths = sorted(glob.glob(os.path.join(basedir, 'rgb', '*png')))
+    rgb_paths = sorted(glob.glob(os.path.join(basedir, 'rgb', '*png')) + glob.glob(os.path.join(basedir, 'rgb', '*jpg')))
 
     all_poses = []
     all_imgs = []
