@@ -13,6 +13,51 @@ import torch.nn.functional as F
 from lib import utils, dvgo
 from lib.load_data import load_data
 
+from typing import Tuple
+from pathlib import Path
+from pipelime.sequences.samples import Sample, PlainSample, SamplesSequence
+from pipelime.sequences.writers.filesystem import UnderfolderWriter
+
+
+class Normalizer16Bit:
+    @classmethod
+    def normalization_key(cls, key: str) -> str:
+        return f"info_{key}"
+
+    @classmethod
+    def normalize_16bits(cls, x: np.ndarray) -> Tuple[np.ndarray, int, int]:
+        m, M = x.min(), x.max()
+        x = (x - m) / (M - m)
+        x = x * (2 ** 16 - 1)
+        return x, m.item(), M.item()
+
+    @classmethod
+    def denormalize_16bits(cls, x: np.ndarray, m: int, M: int) -> np.ndarray:
+        return x / (2 ** 16 - 1) * (M - m) + m
+
+    @classmethod
+    def get_float_item(cls, sample: Sample, key: str) -> np.ndarray:
+        raw = sample[key]
+        norm_key = cls.normalization_key(key)
+        norm_dict = sample[norm_key]["normalization"]
+        m, M = norm_dict["min"], norm_dict["max"]
+        item = cls.denormalize_16bits(raw, m, M)
+        return item
+
+    @classmethod
+    def set_float_item(cls, sample: Sample, key: str, array: np.ndarray) -> None:
+        item, m, M = cls.normalize_16bits(array)
+        item = item.astype(np.uint16)
+        norm_dict = {
+            "normalization": {
+                "min": m,
+                "max": M,
+            }
+        }
+        norm_key = cls.normalization_key(key)
+        sample[key] = item
+        sample[norm_key] = norm_dict
+
 
 def config_parser():
     '''Define command line arguments
@@ -109,13 +154,11 @@ def render_viewpoints(model, render_poses, HW, Ks, ndc, render_kwargs,
             if eval_lpips_vgg:
                 lpips_vgg.append(utils.rgb_lpips(rgb, gt_imgs[i], net_name='vgg', device=c2w.device))
 
-        if savedir is not None:
-            rgb8 = utils.to8b(rgbs[-1])
-            filename = os.path.join(savedir, '{:03d}.png'.format(i))
-            imageio.imwrite(filename, rgb8)
+        # if savedir is not None:
+        #     rgb8 = utils.to8b(rgbs[-1])
+        #     filename = os.path.join(savedir, '{:03d}.png'.format(i))
+        #     imageio.imwrite(filename, rgb8)
 
-    rgbs = np.array(rgbs)
-    disps = np.array(disps)
     if len(psnrs):
         '''
         print('Testing psnr', [f'{p:.3f}' for p in psnrs])
@@ -127,6 +170,29 @@ def render_viewpoints(model, render_poses, HW, Ks, ndc, render_kwargs,
         if eval_ssim: print('Testing ssim', np.mean(ssims), '(avg)')
         if eval_lpips_vgg: print('Testing lpips (vgg)', np.mean(lpips_vgg), '(avg)')
         if eval_lpips_alex: print('Testing lpips (alex)', np.mean(lpips_alex), '(avg)')
+
+    rgbs = np.array(rgbs)
+    disps = np.array(disps)
+    depths = 1 / disps
+
+    samples = []
+    for i in range(len(rgbs)):
+        sample = PlainSample(id=i)
+        sample["image"] = (np.clip(rgbs[i], 0, 1) * 255).astype(np.uint8)
+        Normalizer16Bit.set_float_item(sample, "depth", depths[i])
+        samples.append(sample)
+
+    writer = UnderfolderWriter(
+        Path(savedir) / "output",
+        extensions_map={
+            "image": "png",
+            "depth": "png",
+            Normalizer16Bit.normalization_key("depth"): "yml",
+        },
+        zfill=5,
+        num_workers=-1,
+    )
+    writer(SamplesSequence(samples))
 
     return rgbs, disps
 
@@ -563,8 +629,8 @@ if __name__=='__main__':
                 savedir=testsavedir,
                 eval_ssim=args.eval_ssim, eval_lpips_alex=args.eval_lpips_alex, eval_lpips_vgg=args.eval_lpips_vgg,
                 **render_viewpoints_kwargs)
-        imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
-        imageio.mimwrite(os.path.join(testsavedir, 'video.disp.mp4'), utils.to8b(disps / np.max(disps)), fps=30, quality=8)
+        # imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
+        # imageio.mimwrite(os.path.join(testsavedir, 'video.disp.mp4'), utils.to8b(disps / np.max(disps)), fps=30, quality=8)
 
     # render testset and eval
     if args.render_test:
@@ -578,8 +644,8 @@ if __name__=='__main__':
                 savedir=testsavedir,
                 eval_ssim=args.eval_ssim, eval_lpips_alex=args.eval_lpips_alex, eval_lpips_vgg=args.eval_lpips_vgg,
                 **render_viewpoints_kwargs)
-        imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
-        imageio.mimwrite(os.path.join(testsavedir, 'video.disp.mp4'), utils.to8b(disps / np.max(disps)), fps=30, quality=8)
+        # imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
+        # imageio.mimwrite(os.path.join(testsavedir, 'video.disp.mp4'), utils.to8b(disps / np.max(disps)), fps=30, quality=8)
 
     # render video
     if args.render_video:
@@ -592,8 +658,8 @@ if __name__=='__main__':
                 render_factor=args.render_video_factor,
                 savedir=testsavedir,
                 **render_viewpoints_kwargs)
-        imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
-        imageio.mimwrite(os.path.join(testsavedir, 'video.disp.mp4'), utils.to8b(disps / np.max(disps)), fps=30, quality=8)
+        # imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
+        # imageio.mimwrite(os.path.join(testsavedir, 'video.disp.mp4'), utils.to8b(disps / np.max(disps)), fps=30, quality=8)
 
     print('Done')
 
