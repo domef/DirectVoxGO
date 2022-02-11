@@ -9,7 +9,7 @@ from .load_deepvoxels import load_dv_data
 from .load_co3d import load_co3d_data
 
 
-def load_data(args, use_masks):
+def load_data(args, use_masks, mask_rays, load_bbox):
 
     K, depths = None, None
 
@@ -65,7 +65,7 @@ def load_data(args, use_masks):
         assert images.shape[-1] == 3
 
     elif args.dataset_type == 'tankstemple':
-        images, poses, render_poses, hwf, K, i_split = load_tankstemple_data(args.datadir)
+        images, poses, render_poses, hwf, K, i_split, bbox = load_tankstemple_data(args.datadir, load_bbox)
         print('Loaded tankstemple', images.shape, render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
 
@@ -75,16 +75,15 @@ def load_data(args, use_masks):
 
         masks = None
         if images.shape[-1] == 4:
-            if not use_masks:
+            masks = images[..., -1]
+            images = images[..., :3]
+            if use_masks:
+                alpha = np.expand_dims(masks, axis=3)
                 if args.white_bkgd:
-                    images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
+                    images = images * alpha + (1.0 - alpha)
                 else:
-                    images = images[...,:3]*images[...,-1:]
-            else:
-                masks = images[..., -1]
-                images = images[..., :3]
-
-        if masks is None:
+                    images = images * alpha
+        else:
             masks = np.ones_like(images)
 
     elif args.dataset_type == 'nsvf':
@@ -155,7 +154,7 @@ def load_data(args, use_masks):
         poses=poses, render_poses=render_poses,
         images=images, depths=depths,
         irregular_shape=irregular_shape,
-        masks=masks
+        masks=masks, bbox=bbox,
     )
     return data_dict
 

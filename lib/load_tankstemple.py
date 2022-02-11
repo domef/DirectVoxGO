@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import cv2
 
 
-def load_tankstemple_data(basedir):
+def load_tankstemple_data(basedir, load_bbox):
     pose_paths = sorted(glob.glob(os.path.join(basedir, 'pose', '*txt')))
     rgb_paths = sorted(glob.glob(os.path.join(basedir, 'rgb', '*png')) + glob.glob(os.path.join(basedir, 'rgb', '*jpg')))
 
@@ -36,5 +36,11 @@ def load_tankstemple_data(basedir):
     else:
         render_poses = poses[i_split[-1]]
 
-    return imgs, poses, render_poses, [H, W, focal], K, i_split
+    if load_bbox:
+        bbox = np.loadtxt(os.path.join(basedir, 'bbox.txt'))
+        bbox = torch.from_numpy(bbox)
+    else:
+        bbox = torch.zeros(6)
+
+    return imgs, poses, render_poses, [H, W, focal], K, i_split, bbox
 

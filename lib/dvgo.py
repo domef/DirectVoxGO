@@ -599,13 +599,13 @@ def get_training_rays_masked(rgb_tr_ori, train_poses, HW, Ks, ndc, inverse_y, fl
         imsz.append(n)
         top += n
 
-    print('get_training_rays_in_maskcache_sampling: ratio', top / N)
+    print('get_training_rays_masked: ratio', top / N)
     rgb_tr = rgb_tr[:top]
     rays_o_tr = rays_o_tr[:top]
     rays_d_tr = rays_d_tr[:top]
     viewdirs_tr = viewdirs_tr[:top]
     eps_time = time.time() - eps_time
-    print('get_training_rays_in_maskcache_sampling: finish (eps time:', eps_time, 'sec)')
+    print('get_training_rays_masked: finish (eps time:', eps_time, 'sec)')
     return rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz
 
 
@@ -700,12 +700,10 @@ def get_training_rays_masked_in_maskcache_sampling(rgb_tr_ori, train_poses, HW, 
         rays_o, rays_d, viewdirs = get_rays_of_a_view(
                 H=H, W=W, K=K, c2w=c2w, ndc=ndc,
                 inverse_y=inverse_y, flip_x=flip_x, flip_y=flip_y)
-        mask = torch.ones(img.shape[:2], device=DEVICE, dtype=torch.bool)
+        mask = torch.empty(img.shape[:2], device=DEVICE, dtype=torch.bool)
         for i in range(0, img.shape[0], CHUNK):
-            rays_pts, mask_outbbox = model.sample_ray(
-                    rays_o=rays_o[i:i+CHUNK], rays_d=rays_d[i:i+CHUNK], **render_kwargs)
-            mask_outbbox[~mask_outbbox] |= (~model.mask_cache(rays_pts[~mask_outbbox]))
-            mask[i:i+CHUNK] &= (~mask_outbbox).any(-1).to(DEVICE)
+            mask[i:i+CHUNK] = model.hit_coarse_geo(
+                rays_o=rays_o[i:i+CHUNK], rays_d=rays_d[i:i+CHUNK], **render_kwargs).to(DEVICE)
         mask = torch.logical_and(mask, obj_mask)
         n = mask.sum()
         rgb_tr[top:top+n].copy_(img[mask])
@@ -715,14 +713,15 @@ def get_training_rays_masked_in_maskcache_sampling(rgb_tr_ori, train_poses, HW, 
         imsz.append(n)
         top += n
 
-    print('get_training_rays_in_maskcache_sampling: ratio', top / N)
+    print('get_training_rays_masked_in_maskcache_sampling: ratio', top / N)
     rgb_tr = rgb_tr[:top]
     rays_o_tr = rays_o_tr[:top]
     rays_d_tr = rays_d_tr[:top]
     viewdirs_tr = viewdirs_tr[:top]
     eps_time = time.time() - eps_time
-    print('get_training_rays_in_maskcache_sampling: finish (eps time:', eps_time, 'sec)')
+    print('get_training_rays_masked_in_maskcache_sampling: finish (eps time:', eps_time, 'sec)')
     return rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz
+
 
 def batch_indices_generator(N, BS):
     # torch.randperm on cuda produce incorrect results in my machine

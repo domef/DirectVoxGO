@@ -96,6 +96,8 @@ def config_parser():
     parser.add_argument("--i_weights", type=int, default=100000,
                         help='frequency of weight ckpt saving')
     parser.add_argument("--use_masks", action="store_true")
+    parser.add_argument("--mask_rays", action="store_true")
+    parser.add_argument("--load_bbox", action="store_true")
     return parser
 
 
@@ -142,7 +144,7 @@ def render_viewpoints(model, render_poses, HW, Ks, ndc, render_kwargs,
         rgb = render_result['rgb_marched'].cpu().numpy()
 
         rgbs.append(rgb)
-        #disps.append(disp)
+        # disps.append(disp)
         if i==0:
             print('Testing', rgb.shape)
 
@@ -163,14 +165,14 @@ def render_viewpoints(model, render_poses, HW, Ks, ndc, render_kwargs,
         if eval_lpips_alex: print('Testing lpips (alex)', np.mean(lpips_alex), '(avg)')
 
     rgbs = np.array(rgbs)
-    disps = np.array(disps)
-    depths = 1 / disps
+    # disps = np.array(disps)
+    # depths = 1 / disps
 
     samples = []
     for i in range(len(rgbs)):
         sample = PlainSample(id=i)
         sample["image"] = (np.clip(rgbs[i], 0, 1) * 255).astype(np.uint8)
-        Normalizer16Bit.set_float_item(sample, "depth", depths[i])
+        # Normalizer16Bit.set_float_item(sample, "depth", depths[i])
         samples.append(sample)
 
     writer = UnderfolderWriter(
@@ -211,13 +213,13 @@ def seed_everything():
 def load_everything(args, cfg):
     '''Load images / poses / camera settings / data split.
     '''
-    data_dict = load_data(cfg.data, args.use_masks)
+    data_dict = load_data(cfg.data, args.use_masks, args.mask_rays, args.load_bbox)
 
     # remove useless field
     kept_keys = {
             'hwf', 'HW', 'Ks', 'near', 'far',
             'i_train', 'i_val', 'i_test', 'irregular_shape',
-            'poses', 'render_poses', 'images', 'masks'}
+            'poses', 'render_poses', 'images', 'masks', 'bbox'}
     for k in list(data_dict.keys()):
         if k not in kept_keys:
             data_dict.pop(k)
@@ -346,7 +348,7 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
             masks = masks[i_train].bool().to('cpu' if cfg.data.load2gpu_on_the_fly else device)
 
         if cfg_train.ray_sampler == 'in_maskcache':
-            if not args.use_masks:
+            if not args.mask_rays:
                 rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz = dvgo.get_training_rays_in_maskcache_sampling(
                         rgb_tr_ori=rgb_tr_ori,
                         train_poses=poses[i_train],
@@ -370,7 +372,7 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
                 HW=HW[i_train], Ks=Ks[i_train], ndc=cfg.data.ndc, inverse_y=cfg.data.inverse_y,
                 flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y)
         else:
-            if not args.use_masks:
+            if not args.mask_rays:
                 rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz = dvgo.get_training_rays(
                     rgb_tr=rgb_tr_ori,
                     train_poses=poses[i_train],
@@ -415,7 +417,7 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
             model.density.data.sub_(1)
 
         # random sample rays
-        if cfg_train.ray_sampler in ['flatten', 'in_maskcache'] or (cfg_train.ray_sampler == 'random' and args.use_masks):
+        if cfg_train.ray_sampler in ['flatten', 'in_maskcache'] or (cfg_train.ray_sampler == 'random' and args.mask_rays):
             sel_i = batch_index_sampler()
             target = rgb_tr[sel_i]
             rays_o = rays_o_tr[sel_i]
@@ -510,7 +512,11 @@ def train(args, cfg, data_dict):
 
     # coarse geometry searching
     eps_coarse = time.time()
-    xyz_min_coarse, xyz_max_coarse = compute_bbox_by_cam_frustrm(args=args, cfg=cfg, **data_dict)
+    if not args.load_bbox:
+        xyz_min_coarse, xyz_max_coarse = compute_bbox_by_cam_frustrm(args=args, cfg=cfg, **data_dict)
+    else:
+        bbox = data_dict['bbox']
+        xyz_min_coarse, xyz_max_coarse = bbox[:3], bbox[3:]
     scene_rep_reconstruction(
             args=args, cfg=cfg,
             cfg_model=cfg.coarse_model_and_render, cfg_train=cfg.coarse_train,
@@ -614,6 +620,7 @@ if __name__=='__main__':
                 'inverse_y': cfg.data.inverse_y,
                 'flip_x': cfg.data.flip_x,
                 'flip_y': cfg.data.flip_y,
+                # 'render_depth': True,
             },
         }
 
