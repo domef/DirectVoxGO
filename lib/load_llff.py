@@ -1,6 +1,6 @@
 import numpy as np
 import os, imageio
-
+import torch
 
 ########## Slightly modified version of LLFF data loading code
 ##########  see https://github.com/Fyusion/LLFF for original
@@ -83,7 +83,12 @@ def _minify(basedir, factors=[], resolutions=[]):
 def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, load_depths=False):
 
     poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy'))
-    poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0])
+    if poses_arr.shape[1] == 17:
+        poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0])
+    elif poses_arr.shape[1] == 14:
+        poses = poses_arr[:, :-2].reshape([-1, 3, 4]).transpose([1,2,0])
+    else:
+        raise NotImplementedError
     bds = poses_arr[:, -2:].transpose([1,0])
 
     img0 = [os.path.join(basedir, 'images', f) for f in sorted(os.listdir(os.path.join(basedir, 'images'))) \
@@ -92,7 +97,10 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, lo
 
     sfx = ''
 
-    if factor is not None and factor != 1:
+    if height is not None and width is not None:
+        _minify(basedir, resolutions=[[height, width]])
+        sfx = '_{}x{}'.format(width, height)
+    elif factor is not None and factor != 1:
         sfx = '_{}'.format(factor)
         _minify(basedir, factors=[factor])
         factor = factor
@@ -117,9 +125,12 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, lo
     imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
     if poses.shape[-1] != len(imgfiles):
         print( 'Mismatch between imgs {} and poses {} !!!!'.format(len(imgfiles), poses.shape[-1]) )
-        return
+        import sys; sys.exit()
 
     sh = imageio.imread(imgfiles[0]).shape
+    if poses.shape[1] == 4:
+        poses = np.concatenate([poses, np.zeros_like(poses[:,[0]])], 1)
+        poses[2, 4, :] = np.load(os.path.join(basedir, 'hwf_cxcy.npy'))[2]
     poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1])
     poses[2, 4, :] = poses[2, 4, :] * 1./factor
 
@@ -266,9 +277,11 @@ def spherify_poses(poses, bds, depths):
     return poses_reset, new_poses, bds, depths
 
 
-def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=False, path_zflat=False, load_depths=False):
+def load_llff_data(basedir, factor=8, width=None, height=None,
+                   recenter=True, bd_factor=.75, spherify=False, path_zflat=False, load_depths=False):
 
-    poses, bds, imgs, *depths = _load_data(basedir, factor=factor, load_depths=load_depths) # factor=8 downsamples original imgs by 8x
+    poses, bds, imgs, *depths = _load_data(basedir, factor=factor, width=width, height=height,
+                                           load_depths=load_depths) # factor=8 downsamples original imgs by 8x
     print('Loaded', basedir, bds.min(), bds.max())
     if load_depths:
         depths = depths[0]
@@ -329,7 +342,7 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
         # Generate poses for spiral path
         render_poses = render_path_spiral(c2w_path, up, rads, focal, zdelta, zrate=.5, rots=N_rots, N=N_views)
 
-    render_poses = np.array(render_poses).astype(np.float32)
+    render_poses = torch.Tensor(render_poses)
 
     c2w = poses_avg(poses)
     print('Data:')

@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from lib import utils, dvgo
+from lib import utils, dvgo, dmpigo
 from lib.load_data import load_data
 
 from typing import Tuple
@@ -116,7 +116,7 @@ def render_viewpoints(model, render_poses, HW, Ks, ndc, render_kwargs,
         Ks[:, :2, :3] //= render_factor
 
     rgbs = []
-    disps = []
+    depths = []
     psnrs = []
     ssims = []
     lpips_alex = []
@@ -129,22 +129,23 @@ def render_viewpoints(model, render_poses, HW, Ks, ndc, render_kwargs,
         rays_o, rays_d, viewdirs = dvgo.get_rays_of_a_view(
                 H, W, K, c2w, ndc, inverse_y=render_kwargs['inverse_y'],
                 flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y)
-        keys = ['rgb_marched']
+        keys = ['rgb_marched', 'depth']
         rays_o = rays_o.flatten(0,-2)
         rays_d = rays_d.flatten(0,-2)
         viewdirs = viewdirs.flatten(0,-2)
         render_result_chunks = [
             {k: v for k, v in model(ro, rd, vd, **render_kwargs).items() if k in keys}
-            for ro, rd, vd in zip(rays_o.split(65536, 0), rays_d.split(65536, 0), viewdirs.split(65536, 0))
+            for ro, rd, vd in zip(rays_o.split(8192, 0), rays_d.split(8192, 0), viewdirs.split(8192, 0))
         ]
         render_result = {
             k: torch.cat([ret[k] for ret in render_result_chunks]).reshape(H,W,-1)
             for k in render_result_chunks[0].keys()
         }
         rgb = render_result['rgb_marched'].cpu().numpy()
+        depth = render_result['depth'].cpu().numpy()
 
         rgbs.append(rgb)
-        # disps.append(disp)
+        depths.append(depth)
         if i==0:
             print('Testing', rgb.shape)
 
@@ -165,14 +166,13 @@ def render_viewpoints(model, render_poses, HW, Ks, ndc, render_kwargs,
         if eval_lpips_alex: print('Testing lpips (alex)', np.mean(lpips_alex), '(avg)')
 
     rgbs = np.array(rgbs)
-    # disps = np.array(disps)
-    # depths = 1 / disps
+    depths = np.array(depths)
 
     samples = []
     for i in range(len(rgbs)):
         sample = PlainSample(id=i)
         sample["image"] = (np.clip(rgbs[i], 0, 1) * 255).astype(np.uint8)
-        # Normalizer16Bit.set_float_item(sample, "depth", depths[i])
+        Normalizer16Bit.set_float_item(sample, "depth", depths[i])
         samples.append(sample)
 
     writer = UnderfolderWriter(
@@ -187,18 +187,7 @@ def render_viewpoints(model, render_poses, HW, Ks, ndc, render_kwargs,
     )
     writer(SamplesSequence(samples))
 
-    # if savedir is not None:
-    #     print(f'Writing images to {savedir}')
-    #     for i in trange(len(rgbs)):
-    #         rgb8 = utils.to8b(rgbs[i])
-    #         filename = os.path.join(savedir, '{:03d}.png'.format(i))
-    #         imageio.imwrite(filename, rgb8)
-
-    # rgbs = np.array(rgbs)
-    # #disps = np.array(disps)
-    # disps = np.zeros_like(rgbs)
-
-    return rgbs, disps
+    return rgbs, depths
 
 
 def seed_everything():
@@ -244,7 +233,10 @@ def compute_bbox_by_cam_frustrm(args, cfg, HW, Ks, poses, i_train, near, far, **
                 H=H, W=W, K=K, c2w=c2w,
                 ndc=cfg.data.ndc, inverse_y=cfg.data.inverse_y,
                 flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y)
-        pts_nf = torch.stack([rays_o+viewdirs*near, rays_o+viewdirs*far])
+        if cfg.data.ndc:
+            pts_nf = torch.stack([rays_o+rays_d*near, rays_o+rays_d*far])
+        else:
+            pts_nf = torch.stack([rays_o+viewdirs*near, rays_o+viewdirs*far])
         xyz_min = torch.minimum(xyz_min, pts_nf.amin((0,1,2)))
         xyz_max = torch.maximum(xyz_max, pts_nf.amax((0,1,2)))
     print('compute_bbox_by_cam_frustrm: xyz_min', xyz_min)
@@ -301,29 +293,44 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
     else:
         reload_ckpt_path = None
 
-    # init model
-    model_kwargs = copy.deepcopy(cfg_model)
-    num_voxels = model_kwargs.pop('num_voxels')
-    if len(cfg_train.pg_scale) and reload_ckpt_path is None:
-        num_voxels = int(num_voxels / (2**len(cfg_train.pg_scale)))
-    model = dvgo.DirectVoxGO(
-        xyz_min=xyz_min, xyz_max=xyz_max,
-        num_voxels=num_voxels,
-        mask_cache_path=coarse_ckpt_path,
-        **model_kwargs)
-    if cfg_model.maskout_near_cam_vox:
-        model.maskout_near_cam_vox(poses[i_train,:3,3], near)
-    model = model.to(device)
-
-    # init optimizer
-    optimizer = utils.create_optimizer_or_freeze_model(model, cfg_train, global_step=0)
-
-    # load checkpoint if there is
+    # init model and optimizer
     if reload_ckpt_path is None:
         print(f'scene_rep_reconstruction ({stage}): train from scratch')
         start = 0
+        # init model
+        model_kwargs = copy.deepcopy(cfg_model)
+        if cfg.data.ndc:
+            print(f'scene_rep_reconstruction ({stage}): \033[96muse multiplane images\033[0m')
+            num_voxels = model_kwargs.pop('num_voxels')
+            if len(cfg_train.pg_scale) and reload_ckpt_path is None:
+                num_voxels = int(num_voxels / (2**len(cfg_train.pg_scale)))
+            model = dmpigo.DirectMPIGO(
+                xyz_min=xyz_min, xyz_max=xyz_max,
+                num_voxels=num_voxels,
+                mask_cache_path=coarse_ckpt_path,
+                **model_kwargs)
+        else:
+            print(f'scene_rep_reconstruction ({stage}): \033[96muse dense voxel grid\033[0m')
+            num_voxels = model_kwargs.pop('num_voxels')
+            if len(cfg_train.pg_scale) and reload_ckpt_path is None:
+                num_voxels = int(num_voxels / (2**len(cfg_train.pg_scale)))
+            model = dvgo.DirectVoxGO(
+                xyz_min=xyz_min, xyz_max=xyz_max,
+                num_voxels=num_voxels,
+                mask_cache_path=coarse_ckpt_path,
+                **model_kwargs)
+            if cfg_model.maskout_near_cam_vox:
+                model.maskout_near_cam_vox(poses[i_train,:3,3], near)
+        model = model.to(device)
+        optimizer = utils.create_optimizer_or_freeze_model(model, cfg_train, global_step=0)
     else:
         print(f'scene_rep_reconstruction ({stage}): reload from {reload_ckpt_path}')
+        if cfg.data.ndc:
+            model_class = dmpigo.DirectMPIGO
+        else:
+            model_class = dvgo.DirectVoxGO
+        model = utils.load_model(model_class, reload_ckpt_path).to(device)
+        optimizer = utils.create_optimizer_or_freeze_model(model, cfg_train, global_step=0)
         model, optimizer, start = utils.load_checkpoint(
                 model, optimizer, reload_ckpt_path, args.no_reload_optimizer)
 
@@ -410,9 +417,21 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
     global_step = -1
     for global_step in trange(1+start, 1+cfg_train.N_iters):
 
+        # renew occupancy grid
+        if model.mask_cache is not None and (global_step + 500) % 1000 == 0:
+            self_alpha = F.max_pool3d(model.activate_density(model.density), kernel_size=3, padding=1, stride=1)[0,0]
+            model.mask_cache.mask &= (self_alpha > model.fast_color_thres)
+
         # progress scaling checkpoint
         if global_step in cfg_train.pg_scale:
-            model.scale_volume_grid(model.num_voxels * 2)
+            n_rest_scales = len(cfg_train.pg_scale)-cfg_train.pg_scale.index(global_step)-1
+            cur_voxels = int(cfg_model.num_voxels / (2**n_rest_scales))
+            if isinstance(model, dvgo.DirectVoxGO):
+                model.scale_volume_grid(cur_voxels)
+            elif isinstance(model, dmpigo.DirectMPIGO):
+                model.scale_volume_grid(cur_voxels, model.mpi_depth)
+            else:
+                raise NotImplementedError
             optimizer = utils.create_optimizer_or_freeze_model(model, cfg_train, global_step=0)
             model.density.data.sub_(1)
 
@@ -455,11 +474,16 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
             rgbper = (render_result['raw_rgb'] - target[render_result['ray_id']]).pow(2).sum(-1)
             rgbper_loss = (rgbper * render_result['weights'].detach()).sum() / len(rays_o)
             loss += cfg_train.weight_rgbper * rgbper_loss
-        if cfg_train.weight_tv_density>0 and global_step>cfg_train.tv_from and global_step%cfg_train.tv_every==0:
-            loss += cfg_train.weight_tv_density * model.density_total_variation()
-        if cfg_train.weight_tv_k0>0 and global_step>cfg_train.tv_from and global_step%cfg_train.tv_every==0:
-            loss += cfg_train.weight_tv_k0 * model.k0_total_variation()
         loss.backward()
+
+        if global_step<cfg_train.tv_before and global_step>cfg_train.tv_after and global_step%cfg_train.tv_every==0:
+            if cfg_train.weight_tv_density>0:
+                model.density_total_variation_add_grad(
+                    cfg_train.weight_tv_density/len(rays_o), global_step<cfg_train.tv_dense_before)
+            if cfg_train.weight_tv_k0>0:
+                model.k0_total_variation_add_grad(
+                    cfg_train.weight_tv_k0/len(rays_o), global_step<cfg_train.tv_dense_before)
+
         optimizer.step()
         psnr_lst.append(psnr.item())
 
@@ -517,21 +541,28 @@ def train(args, cfg, data_dict):
     else:
         bbox = data_dict['bbox']
         xyz_min_coarse, xyz_max_coarse = bbox[:3], bbox[3:]
-    scene_rep_reconstruction(
-            args=args, cfg=cfg,
-            cfg_model=cfg.coarse_model_and_render, cfg_train=cfg.coarse_train,
-            xyz_min=xyz_min_coarse, xyz_max=xyz_max_coarse,
-            data_dict=data_dict, stage='coarse')
-    eps_coarse = time.time() - eps_coarse
-    eps_time_str = f'{eps_coarse//3600:02.0f}:{eps_coarse//60%60:02.0f}:{eps_coarse%60:02.0f}'
-    print('train: coarse geometry searching in', eps_time_str)
+    if cfg.coarse_train.N_iters > 0:
+        scene_rep_reconstruction(
+                args=args, cfg=cfg,
+                cfg_model=cfg.coarse_model_and_render, cfg_train=cfg.coarse_train,
+                xyz_min=xyz_min_coarse, xyz_max=xyz_max_coarse,
+                data_dict=data_dict, stage='coarse')
+        eps_coarse = time.time() - eps_coarse
+        eps_time_str = f'{eps_coarse//3600:02.0f}:{eps_coarse//60%60:02.0f}:{eps_coarse%60:02.0f}'
+        print('train: coarse geometry searching in', eps_time_str)
+        coarse_ckpt_path = os.path.join(cfg.basedir, cfg.expname, f'coarse_last.tar')
+    else:
+        print('train: skip coarse geometry searching')
+        coarse_ckpt_path = None
 
     # fine detail reconstruction
     eps_fine = time.time()
-    coarse_ckpt_path = os.path.join(cfg.basedir, cfg.expname, f'coarse_last.tar')
-    xyz_min_fine, xyz_max_fine = compute_bbox_by_coarse_geo(
-            model_class=dvgo.DirectVoxGO, model_path=coarse_ckpt_path,
-            thres=cfg.fine_model_and_render.bbox_thres)
+    if cfg.data.ndc:
+        xyz_min_fine, xyz_max_fine = xyz_min_coarse.clone(), xyz_max_coarse.clone()
+    else:
+        xyz_min_fine, xyz_max_fine = compute_bbox_by_coarse_geo(
+                model_class=dvgo.DirectVoxGO, model_path=coarse_ckpt_path,
+                thres=cfg.fine_model_and_render.bbox_thres)
     scene_rep_reconstruction(
             args=args, cfg=cfg,
             cfg_model=cfg.fine_model_and_render, cfg_train=cfg.fine_train,
@@ -607,7 +638,11 @@ if __name__=='__main__':
         else:
             ckpt_path = os.path.join(cfg.basedir, cfg.expname, 'fine_last.tar')
         ckpt_name = ckpt_path.split('/')[-1][:-4]
-        model = utils.load_model(dvgo.DirectVoxGO, ckpt_path).to(device)
+        if cfg.data.ndc:
+            model_class = dmpigo.DirectMPIGO
+        else:
+            model_class = dvgo.DirectVoxGO
+        model = utils.load_model(model_class, ckpt_path).to(device)
         stepsize = cfg.fine_model_and_render.stepsize
         render_viewpoints_kwargs = {
             'model': model,
@@ -620,7 +655,7 @@ if __name__=='__main__':
                 'inverse_y': cfg.data.inverse_y,
                 'flip_x': cfg.data.flip_x,
                 'flip_y': cfg.data.flip_y,
-                # 'render_depth': True,
+                'render_depth': True,
             },
         }
 
@@ -628,7 +663,7 @@ if __name__=='__main__':
     if args.render_train:
         testsavedir = os.path.join(cfg.basedir, cfg.expname, f'render_train_{ckpt_name}')
         os.makedirs(testsavedir, exist_ok=True)
-        rgbs, disps = render_viewpoints(
+        rgbs, depths = render_viewpoints(
                 render_poses=data_dict['poses'][data_dict['i_train']],
                 HW=data_dict['HW'][data_dict['i_train']],
                 Ks=data_dict['Ks'][data_dict['i_train']],
@@ -636,14 +671,14 @@ if __name__=='__main__':
                 savedir=testsavedir,
                 eval_ssim=args.eval_ssim, eval_lpips_alex=args.eval_lpips_alex, eval_lpips_vgg=args.eval_lpips_vgg,
                 **render_viewpoints_kwargs)
-        # imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
-        # imageio.mimwrite(os.path.join(testsavedir, 'video.disp.mp4'), utils.to8b(disps / np.max(disps)), fps=30, quality=8)
+        imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
+        imageio.mimwrite(os.path.join(testsavedir, 'video.depth.mp4'), utils.to8b(1 - depths / np.max(depths)), fps=30, quality=8)
 
     # render testset and eval
     if args.render_test:
         testsavedir = os.path.join(cfg.basedir, cfg.expname, f'render_test_{ckpt_name}')
         os.makedirs(testsavedir, exist_ok=True)
-        rgbs, disps = render_viewpoints(
+        rgbs, depths = render_viewpoints(
                 render_poses=data_dict['poses'][data_dict['i_test']],
                 HW=data_dict['HW'][data_dict['i_test']],
                 Ks=data_dict['Ks'][data_dict['i_test']],
@@ -651,22 +686,22 @@ if __name__=='__main__':
                 savedir=testsavedir,
                 eval_ssim=args.eval_ssim, eval_lpips_alex=args.eval_lpips_alex, eval_lpips_vgg=args.eval_lpips_vgg,
                 **render_viewpoints_kwargs)
-        # imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
-        # imageio.mimwrite(os.path.join(testsavedir, 'video.disp.mp4'), utils.to8b(disps / np.max(disps)), fps=30, quality=8)
+        imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
+        imageio.mimwrite(os.path.join(testsavedir, 'video.depth.mp4'), utils.to8b(1 - depths / np.max(depths)), fps=30, quality=8)
 
     # render video
     if args.render_video:
         testsavedir = os.path.join(cfg.basedir, cfg.expname, f'render_video_{ckpt_name}')
         os.makedirs(testsavedir, exist_ok=True)
-        rgbs, disps = render_viewpoints(
+        rgbs, depths = render_viewpoints(
                 render_poses=data_dict['render_poses'],
                 HW=data_dict['HW'][data_dict['i_test']][[0]].repeat(len(data_dict['render_poses']), 0),
                 Ks=data_dict['Ks'][data_dict['i_test']][[0]].repeat(len(data_dict['render_poses']), 0),
                 render_factor=args.render_video_factor,
                 savedir=testsavedir,
                 **render_viewpoints_kwargs)
-        # imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
-        # imageio.mimwrite(os.path.join(testsavedir, 'video.disp.mp4'), utils.to8b(disps / np.max(disps)), fps=30, quality=8)
+        imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
+        imageio.mimwrite(os.path.join(testsavedir, 'video.depth.mp4'), utils.to8b(1 - depths / np.max(depths)), fps=30, quality=8)
 
     print('Done')
 
