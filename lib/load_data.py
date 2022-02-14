@@ -73,7 +73,6 @@ def load_data(args, use_masks, mask_rays, load_bbox):
 
         print(f'NEAR, FAR: {near}, {far}')
 
-        masks = None
         if images.shape[-1] == 4:
             masks = images[..., -1]
             images = images[..., :3]
