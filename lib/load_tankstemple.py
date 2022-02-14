@@ -38,9 +38,9 @@ def load_tankstemple_data(basedir, load_bbox):
 
     if load_bbox:
         bbox = np.loadtxt(os.path.join(basedir, 'bbox.txt'))
-        bbox = torch.from_numpy(bbox)
+        bbox = torch.from_numpy(bbox).float()
     else:
-        bbox = torch.zeros(6)
+        bbox = torch.zeros(6).float()
 
     return imgs, poses, render_poses, [H, W, focal], K, i_split, bbox
 

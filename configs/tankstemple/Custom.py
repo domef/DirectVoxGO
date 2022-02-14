@@ -12,12 +12,13 @@ data = dict(
 )
 
 coarse_train = dict(
-    N_iters=10000 // 4 * 3,
+    N_iters=5000 // 4 * 3,
+    pervoxel_lr_downrate=2,
 )
 
 fine_train = dict(
     N_iters=20000 // 4 * 3,
-    pg_scale=[1000, 2000, 3000, 5000, 7000, 9000],
+    pg_scale=[1000, 2000, 3000, 4000, 6000, 8000, 10000],
 )
 
 coarse_model_and_render = dict(
